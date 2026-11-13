@@ -25,11 +25,8 @@ const makeFetchMock = (
   const calls: RecordedCall[] = [];
   const mock: typeof fetch = async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const rawHeaders = (init?.headers ?? {}) as Record<string, string>;
     const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(rawHeaders)) {
-      headers[k.toLowerCase()] = v;
-    }
+    new Headers(init?.headers).forEach((value, name) => { headers[name] = value; });
     const bodyStr = typeof init?.body === "string" ? init.body : undefined;
     const parsed = bodyStr ? JSON.parse(bodyStr) : undefined;
     const call: RecordedCall = {
@@ -113,6 +110,8 @@ describe("ComputersClient", () => {
     assert.equal(result.lastError, null);
   });
 
+  // Value: protects=the caller idempotency key is sent once; fails_when=differently cased keys coexist;
+  // why_new=the old mock collapsed duplicate header names; seam=none
   it("create() leaves defaults to the backend when no params are provided", async () => {
     const { fetch, calls } = makeFetchMock(() => ({
       status: 201,
@@ -134,6 +133,18 @@ describe("ComputersClient", () => {
 
     assert.deepEqual(calls[0]!.body, {});
     assert.deepEqual(result.networkPolicy, { mode: "open" });
+    const firstKey = calls[0]!.headers["idempotency-key"];
+    assert.match(firstKey ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    await client.create();
+    assert.notEqual(calls[1]!.headers["idempotency-key"], firstKey);
+    await client.create({}, { headers: { "idempotency-key": "caller-key", "X-Test": "kept" } });
+    assert.equal(calls[2]!.headers["idempotency-key"], "caller-key");
+    assert.equal(calls[2]!.headers["x-test"], "kept");
+    const configured = new ComputersClient({ ...makeConfig(fetch), headers: { "Idempotency-Key": "config-key" } });
+    await configured.create();
+    assert.equal(calls[3]!.headers["idempotency-key"], "config-key");
+    await configured.create({}, { headers: { "idempotency-key": "override-key" } });
+    assert.equal(calls[4]!.headers["idempotency-key"], "override-key");
   });
 
   it("create() can explicitly disable a persistent home", async () => {
@@ -416,225 +427,102 @@ describe("ComputersClient", () => {
     );
   });
 
-  it("execStream() parses fragmented SSE events and forwards AbortSignal", async () => {
-    const encoder = new TextEncoder();
+  it("execStream() adapts the buffered Cloud API response and forwards request options", async () => {
     const controller = new AbortController();
-    let requestUrl = "";
-    let requestBody: unknown;
     let requestSignal: AbortSignal | null | undefined;
-    const fetch: typeof globalThis.fetch = async (input, init) => {
-      requestUrl = String(input);
-      requestBody = JSON.parse(String(init?.body));
+    const { fetch, calls } = makeFetchMock(() => ({
+      status: 200,
+      body: {
+        exit_code: 7, stdout: "hello\n", stderr: "warn\n",
+        command_id: "cmd_1", duration_ms: 25, timed_out: false,
+      },
+    }));
+    const client = new ComputersClient(makeConfig(async (input, init) => {
       requestSignal = init?.signal;
-      const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-          streamController.enqueue(
-            encoder.encode(
-              'data: {"type":"started","command_id":"cmd_1","started_at_unix_ms":10,',
-            ),
-          );
-          streamController.enqueue(
-            encoder.encode(
-              '"timeout_seconds":60}\n\ndata: {"type":"stdout","data":"hello\\n"}\n',
-            ),
-          );
-          streamController.enqueue(
-            encoder.encode(
-              'data: {"type":"stderr","data":"warn\\n"}\ndata: {"type":"exit","exit_code":0,"started_at_unix_ms":10,"ended_at_unix_ms":35,"duration_ms":25,"timed_out":false}\n',
-            ),
-          );
-          streamController.close();
-        },
-      });
-      return new Response(body, {
-        status: 200,
-        headers: {
-          "content-type": "text/event-stream",
-          "x-celesto-command-id": "cmd_1",
-        },
-      });
-    };
-    const client = new ComputersClient(makeConfig(fetch));
-
+      return fetch(input, init);
+    }));
     const events = [];
-    for await (const event of client.execStream("cmp_1", "echo hello", {
-      timeout: 60,
-      signal: controller.signal,
-    })) {
+    for await (const event of client.execStream("my computer", "echo hello", {
+      timeout: 60, signal: controller.signal,
+    }, { headers: { "X-Test": "forwarded" } })) {
       events.push(event);
     }
-
-    assert.equal(requestUrl, "https://api.example.test/v1/computers/cmp_1/exec/stream");
-    assert.deepEqual(requestBody, { command: "echo hello", timeout: 60 });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, "https://api.example.test/v1/computers/my%20computer/exec");
+    assert.deepEqual(calls[0]!.body, { command: "echo hello", timeout: 60 });
+    assert.equal(calls[0]!.headers["x-test"], "forwarded");
     assert.equal(requestSignal, controller.signal);
     assert.deepEqual(events, [
-      { type: "started", commandId: "cmd_1", startedAtUnixMs: 10, timeoutSeconds: 60 },
       { type: "stdout", data: "hello\n" },
       { type: "stderr", data: "warn\n" },
-      {
-        type: "exit",
-        exitCode: 0,
-        commandId: "cmd_1",
-        startedAtUnixMs: 10,
-        endedAtUnixMs: 35,
-        durationMs: 25,
-        timedOut: false,
-      },
+      { type: "exit", exitCode: 7, commandId: "cmd_1", durationMs: 25, timedOut: false },
     ]);
   });
 
-  it("execStream() rejects malformed and invalid SSE payloads", async () => {
-    const cases = [
-      {
-        payload: "{not json",
-        message: "Celesto returned malformed JSON in the command stream.",
-      },
-      {
-        payload: '{"type":"started","command_id":1}',
-        message: "Celesto returned an invalid command-start event.",
-      },
-      {
-        payload: '{"type":"exit","exit_code":"0"}',
-        message: "Celesto returned an invalid command-exit event.",
-      },
-      {
-        payload: '{"type":"future.event"}',
-        message: "Celesto returned an unknown command stream event.",
-      },
-      {
-        payload: "null",
-        message: "Celesto returned an invalid command stream event.",
-      },
-    ];
-
-    for (const testCase of cases) {
-      const fetch: typeof globalThis.fetch = async () =>
-        new Response(`data: ${testCase.payload}\n`, {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
-        });
+  it("execStream() returns an exit event for silent commands and omits unavailable metadata", async () => {
+    for (const metadata of [{}, { command_id: null, duration_ms: null, timed_out: null }]) {
+      const { fetch } = makeFetchMock(() => ({
+        status: 200,
+        body: { exit_code: 0, stdout: "", stderr: "", ...metadata },
+      }));
       const client = new ComputersClient(makeConfig(fetch));
-
-      await assert.rejects(
-        async () => {
-          for await (const _event of client.execStream("cmp_1", "true")) {
-            // Invalid events must fail before they are yielded.
-          }
-        },
-        (error: unknown) =>
-          error instanceof Error && error.message === testCase.message,
-      );
+      const events = [];
+      for await (const event of client.execStream("cmp_1", "true")) events.push(event);
+      assert.deepEqual(events, [{ type: "exit", exitCode: 0 }]);
     }
   });
 
-  it("execStream() finishes on exit without waiting for the server to close", async () => {
-    const encoder = new TextEncoder();
-    let cancelled = false;
-    const fetch: typeof globalThis.fetch = async () => {
-      const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-          streamController.enqueue(
-            encoder.encode(
-              'data: {"type":"exit","exit_code":0,"command_id":"cmd_1"}\n',
-            ),
-          );
-        },
-        cancel() {
-          cancelled = true;
-        },
-      });
-      return new Response(body, { status: 200 });
-    };
+  it("execStream() preserves command timeouts and propagates API failures without replay", async () => {
+    const { fetch, calls } = makeFetchMock(() => ({
+      status: 200,
+      body: { exit_code: 124, stdout: "partial", stderr: "", timed_out: true },
+    }));
     const client = new ComputersClient(makeConfig(fetch));
     const events = [];
+    for await (const event of client.execStream("cmp_1", "sleep 60")) events.push(event);
+    assert.deepEqual(events, [
+      { type: "stdout", data: "partial" },
+      { type: "exit", exitCode: 124, timedOut: true },
+    ]);
+    assert.equal(calls.length, 1);
 
-    for await (const event of client.execStream("cmp_1", "true")) {
-      events.push(event);
-    }
-
-    assert.deepEqual(events, [{ type: "exit", exitCode: 0, commandId: "cmd_1" }]);
-    assert.equal(cancelled, true);
+    const failure = makeFetchMock(() => ({ status: 503, body: { detail: "Host unavailable" } }));
+    const failingClient = new ComputersClient(makeConfig(failure.fetch));
+    await assert.rejects(failingClient.execStream("cmp_1", "true").next(),
+      (error: unknown) => error instanceof CelestoApiError && error.status === 503);
+    assert.equal(failure.calls.length, 1);
   });
 
-  it("execStream() cancels the response body when iteration stops", async () => {
-    const encoder = new TextEncoder();
-    let cancelled = false;
-    const fetch: typeof globalThis.fetch = async () => {
-      const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-          streamController.enqueue(
-            encoder.encode(
-              'data: {"type":"started","command_id":"cmd_1","started_at_unix_ms":10,"timeout_seconds":60}\n',
-            ),
-          );
-        },
-        cancel() {
-          cancelled = true;
-        },
-      });
-      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-    };
-    const client = new ComputersClient(makeConfig(fetch));
-    const iterator = client.execStream("cmp_1", "sleep 60");
-
-    assert.equal((await iterator.next()).value?.type, "started");
-    await iterator.return(undefined);
-
-    assert.equal(cancelled, true);
-  });
-
-  it("execStream() wraps failures that happen after response headers", async () => {
-    const encoder = new TextEncoder();
+  it("execStream() aborts while receiving the buffered response", async () => {
     const controller = new AbortController();
-    const fetch: typeof globalThis.fetch = async (_input, init) => {
-      const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-          streamController.enqueue(
-            encoder.encode(
-              'data: {"type":"started","command_id":"cmd_1","started_at_unix_ms":10,"timeout_seconds":60}\n',
-            ),
-          );
-          init?.signal?.addEventListener(
-            "abort",
-            () => streamController.error(new DOMException("Aborted", "AbortError")),
-            { once: true },
-          );
+    const fetch: typeof globalThis.fetch = async (_input, init) => new Response(
+      new ReadableStream<Uint8Array>({
+        start(body) {
+          init?.signal?.addEventListener("abort", () => {
+            body.error(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+          controller.abort();
         },
-      });
-      return new Response(body, { status: 200 });
-    };
-    const client = new ComputersClient(makeConfig(fetch));
-    const iterator = client.execStream("cmp_1", "sleep 60", { signal: controller.signal });
-
-    assert.equal((await iterator.next()).value?.type, "started");
-    controller.abort();
-
-    await assert.rejects(
-      () => iterator.next(),
-      (error: unknown) => error instanceof CelestoNetworkError,
+      }), { headers: { "content-type": "application/json" } },
     );
+    const client = new ComputersClient(makeConfig(fetch));
+    await assert.rejects(client.execStream("cmp_1", "sleep 60", { signal: controller.signal }).next(),
+      (error: unknown) => error instanceof CelestoNetworkError);
   });
 
-  it("execStream() applies the configured request timeout to the full stream", async () => {
-    const fetch: typeof globalThis.fetch = async (_input, init) => {
-      const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-          init?.signal?.addEventListener(
-            "abort",
-            () => streamController.error(new DOMException("Timed out", "AbortError")),
-            { once: true },
-          );
+  it("execStream() applies the configured timeout through response consumption", async () => {
+    const fetch: typeof globalThis.fetch = async (_input, init) => new Response(
+      new ReadableStream<Uint8Array>({
+        start(body) {
+          init?.signal?.addEventListener("abort", () => {
+            body.error(new DOMException("Timed out", "AbortError"));
+          }, { once: true });
         },
-      });
-      return new Response(body, { status: 200 });
-    };
-    const client = new ComputersClient({ ...makeConfig(fetch), timeoutMs: 5 });
-    const iterator = client.execStream("cmp_1", "sleep 60");
-
-    await assert.rejects(
-      () => iterator.next(),
-      (error: unknown) => error instanceof CelestoNetworkError,
+      }), { headers: { "content-type": "application/json" } },
     );
+    const client = new ComputersClient({ ...makeConfig(fetch), timeoutMs: 5 });
+    await assert.rejects(client.execStream("cmp_1", "sleep 60").next(),
+      (error: unknown) => error instanceof CelestoNetworkError);
   });
 
   it("listCommandHistory() maps command records", async () => {

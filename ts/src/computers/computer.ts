@@ -148,7 +148,7 @@ export class Computer {
     return this.run(command, params);
   }
 
-  /** Run a shell command and stream output and exit events as they arrive. */
+  /** Run a shell command, then yield buffered stdout, stderr, and exit events. */
   runStream(
     command: string,
     params: ExecParams = {},

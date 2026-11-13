@@ -318,7 +318,7 @@ try {
 }
 ```
 
-Stream output while the command is running:
+Consume command output as events. The Cloud API buffers output until the command finishes:
 
 ```js
 import { Computer } from "@celestoai/sdk";
@@ -336,7 +336,7 @@ for await (const event of computer.runStream("npm test", {
 }
 ```
 
-Call `controller.abort()` to stop the stream and the remote command.
+Call `controller.abort()` to cancel the pending request.
 
 ### Manage Computers
 

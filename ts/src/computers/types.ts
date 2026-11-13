@@ -159,7 +159,7 @@ export interface CreateComputerParams {
 export interface ExecParams {
   /** Timeout in seconds (1-300). Defaults to 30. */
   timeout?: number;
-  /** Abort the HTTP request. Streaming requests also stop the remote command. */
+  /** Abort the pending HTTP request. */
   signal?: AbortSignal;
 }
 

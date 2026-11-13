@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
+
 import { buildRequestContext, ClientConfig, RequestOverrides } from "../core/config";
-import { CelestoError, CelestoNetworkError } from "../core/errors";
-import { request, requestStream } from "../core/http";
+import { CelestoError } from "../core/errors";
+import { request } from "../core/http";
 import {
   BrowserConnectionInfo,
   ComputerCommandHistoryEntry,
@@ -415,83 +417,6 @@ const pickOverrides = (options?: RequestOverrides): RequestOverrides => ({
   signal: options?.signal,
 });
 
-const optionalNumber = (value: unknown): number | undefined =>
-  typeof value === "number" ? value : undefined;
-
-const optionalBoolean = (value: unknown): boolean | undefined =>
-  typeof value === "boolean" ? value : undefined;
-
-const parseExecStreamEvent = (value: unknown): ComputerExecStreamEvent => {
-  if (!value || typeof value !== "object") {
-    throw new Error("Celesto returned an invalid command stream event.");
-  }
-
-  const event = value as Record<string, unknown>;
-  if (event.type === "stdout" || event.type === "stderr") {
-    if (typeof event.data !== "string") {
-      throw new Error("Celesto returned command output without text data.");
-    }
-    return { type: event.type, data: event.data };
-  }
-
-  if (event.type === "started") {
-    if (
-      typeof event.command_id !== "string" ||
-      typeof event.started_at_unix_ms !== "number" ||
-      typeof event.timeout_seconds !== "number"
-    ) {
-      throw new Error("Celesto returned an invalid command-start event.");
-    }
-    return {
-      type: "started",
-      commandId: event.command_id,
-      startedAtUnixMs: event.started_at_unix_ms,
-      timeoutSeconds: event.timeout_seconds,
-    };
-  }
-
-  if (event.type === "exit") {
-    if (typeof event.exit_code !== "number") {
-      throw new Error("Celesto returned an invalid command-exit event.");
-    }
-    const result: Extract<ComputerExecStreamEvent, { type: "exit" }> = {
-      type: "exit",
-      exitCode: event.exit_code,
-    };
-    if (typeof event.command_id === "string") result.commandId = event.command_id;
-    const startedAtUnixMs = optionalNumber(event.started_at_unix_ms);
-    const endedAtUnixMs = optionalNumber(event.ended_at_unix_ms);
-    const durationMs = optionalNumber(event.duration_ms);
-    const timedOut = optionalBoolean(event.timed_out);
-    if (startedAtUnixMs !== undefined) result.startedAtUnixMs = startedAtUnixMs;
-    if (endedAtUnixMs !== undefined) result.endedAtUnixMs = endedAtUnixMs;
-    if (durationMs !== undefined) result.durationMs = durationMs;
-    if (timedOut !== undefined) result.timedOut = timedOut;
-    return result;
-  }
-
-  throw new Error("Celesto returned an unknown command stream event.");
-};
-
-const parseSseDataLine = (line: string): ComputerExecStreamEvent | undefined => {
-  const text = line.trim();
-  if (!text || !text.startsWith("data:")) {
-    return undefined;
-  }
-  const data = text.slice("data:".length).trim();
-  if (!data || data === "[DONE]") {
-    return undefined;
-  }
-  try {
-    return parseExecStreamEvent(JSON.parse(data));
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new Error("Celesto returned malformed JSON in the command stream.");
-    }
-    throw error;
-  }
-};
-
 const createManagedSignal = (
   signal: AbortSignal | undefined,
   timeoutMs: number | undefined,
@@ -518,20 +443,6 @@ const createManagedSignal = (
   };
 };
 
-const toNetworkError = (error: unknown): CelestoNetworkError => {
-  if (error instanceof CelestoNetworkError) return error;
-  const cause = error instanceof Error ? error : new Error(String(error));
-  return new CelestoNetworkError(cause.message, cause);
-};
-
-const withFallbackCommandId = (
-  event: ComputerExecStreamEvent,
-  commandId: string | undefined,
-): ComputerExecStreamEvent => {
-  if (event.type !== "exit" || event.commandId || !commandId) return event;
-  return { ...event, commandId };
-};
-
 /**
  * Client for managing sandboxed computers (AI sandboxes).
  *
@@ -555,11 +466,18 @@ export class ComputersClient {
 
   async create(params: CreateComputerParams = {}, options?: RequestOverrides): Promise<ComputerInfo> {
     const ctx = buildRequestContext(this.config);
+    const headers = new Headers(ctx.headers);
+    for (const [name, value] of Object.entries(options?.headers ?? {})) headers.set(name, value);
+    ctx.headers = { ...ctx.headers, ...options?.headers };
+    for (const name of Object.keys(ctx.headers)) {
+      if (name.toLowerCase() === "idempotency-key") delete ctx.headers[name];
+    }
+    ctx.headers["Idempotency-Key"] = headers.get("Idempotency-Key") ?? randomUUID();
     const data = await request<ComputerInfoWire>(ctx, {
       method: "POST",
       path: computersPath(""),
       body: buildCreateComputerBody(params),
-      ...pickOverrides(options),
+      signal: options?.signal,
     });
     return toComputerInfo(data);
   }
@@ -631,90 +549,23 @@ export class ComputersClient {
     }
   }
 
+  /** Yield output events after the Cloud API's buffered execution completes. */
   async *execStream(
     computerId: string,
     command: string,
     params: ExecParams = {},
     options?: RequestOverrides,
   ): AsyncGenerator<ComputerExecStreamEvent> {
-    const ctx = buildRequestContext(this.config);
-    const managedSignal = createManagedSignal(
-      params.signal ?? options?.signal,
-      this.config.timeoutMs,
-    );
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    let completed = false;
-
-    try {
-      const response = await requestStream(ctx, {
-        method: "POST",
-        path: computersPath(`/${encodeURIComponent(computerId)}/exec/stream`),
-        body: {
-          command,
-          timeout: params.timeout ?? 30,
-        },
-        headers: options?.headers,
-        signal: managedSignal.signal,
-      });
-      if (!response.body) {
-        throw new Error("Celesto did not return a command output stream.");
-      }
-
-      const responseCommandId = response.headers.get("x-celesto-command-id") ?? undefined;
-      reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        let chunk: ReadableStreamReadResult<Uint8Array>;
-        try {
-          chunk = await reader.read();
-        } catch (error) {
-          throw toNetworkError(error);
-        }
-        if (chunk.done) {
-          completed = true;
-          buffer += decoder.decode();
-          break;
-        }
-        buffer += decoder.decode(chunk.value, { stream: true });
-
-        let newlineIndex = buffer.indexOf("\n");
-        while (newlineIndex !== -1) {
-          const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
-          buffer = buffer.slice(newlineIndex + 1);
-          const parsed = parseSseDataLine(line);
-          if (parsed) {
-            const event = withFallbackCommandId(parsed, responseCommandId);
-            yield event;
-            if (event.type === "exit") return;
-          }
-          newlineIndex = buffer.indexOf("\n");
-        }
-      }
-
-      if (buffer) {
-        const parsed = parseSseDataLine(buffer);
-        if (parsed) {
-          const event = withFallbackCommandId(parsed, responseCommandId);
-          yield event;
-          if (event.type === "exit") return;
-        }
-      }
-      throw new Error("Command stream ended before Celesto returned an exit status.");
-    } finally {
-      if (reader) {
-        if (!completed) {
-          try {
-            await reader.cancel();
-          } catch {
-            // The request may already be aborted or disconnected.
-          }
-        }
-        reader.releaseLock();
-      }
-      managedSignal.cleanup();
-    }
+    const result = await this.exec(computerId, command, params, options);
+    if (result.stdout) yield { type: "stdout", data: result.stdout };
+    if (result.stderr) yield { type: "stderr", data: result.stderr };
+    yield {
+      type: "exit",
+      exitCode: result.exitCode,
+      ...(result.commandId != null ? { commandId: result.commandId } : {}),
+      ...(result.durationMs != null ? { durationMs: result.durationMs } : {}),
+      ...(result.timedOut != null ? { timedOut: result.timedOut } : {}),
+    };
   }
 
   async listCommandHistory(
