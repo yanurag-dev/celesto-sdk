@@ -7,6 +7,7 @@ import test from "node:test";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ExtensionToolContext,
   SessionStartEvent,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -159,6 +160,8 @@ test("/celesto push uploads once, persists its revision, and reports skipped fil
   }
 });
 
+// Value: protects=remote cwd replaces the session cwd while preserving instruction examples;
+// fails_when=an earlier example cwd block is replaced instead; why_new=previous inputs contained only one cwd block; seam=none
 test("extension-created computers use a persistent home", async () => {
   const originalCreate = Computer.create;
   try {
@@ -214,6 +217,30 @@ test("extension-created computers use a persistent home", async () => {
     }
 
     assert.deepEqual(createParams, { persistentHome: true });
+    const promptHandler = handlers.get("before_agent_start")?.[0];
+    assert(promptHandler);
+    for (const instructionsBefore of [
+      "Instructions before <cwd>/example/path</cwd>",
+      "Instructions before mention `<cwd>` without a closing tag",
+    ]) {
+      for (const cwdSection of [
+        `<cwd>${context.cwd}</cwd>`,
+        `<cwd>\n${context.cwd}\n</cwd>`,
+        `Current working directory: ${context.cwd}`,
+        "Custom prompt without a cwd section",
+      ]) {
+        const prompt = `${instructionsBefore}\n${cwdSection}\nInstructions after`;
+        const result = await promptHandler({ systemPrompt: prompt }, context) as { systemPrompt: string };
+        assert(!result.systemPrompt.includes(context.cwd), result.systemPrompt);
+        assert.equal(result.systemPrompt.split(REMOTE_ROOT).length - 1, 1, result.systemPrompt);
+        assert(result.systemPrompt.includes(instructionsBefore));
+        assert(result.systemPrompt.includes("Instructions after"));
+        if (cwdSection.startsWith("<cwd>")) {
+          assert(result.systemPrompt.includes(`<cwd>${REMOTE_ROOT}</cwd>`));
+          assert(!result.systemPrompt.includes("Current working directory:"));
+        }
+      }
+    }
   } finally {
     Computer.create = originalCreate;
   }
@@ -264,7 +291,7 @@ test("local tools use the session cwd without --celesto", async () => {
         setStatus() {},
         notify() {},
       },
-    } as unknown as ExtensionContext;
+    } as unknown as ExtensionToolContext;
     for (const handler of handlers.get("session_start") ?? []) {
       await handler(
         { type: "session_start", reason: "startup" } satisfies SessionStartEvent,
@@ -272,6 +299,9 @@ test("local tools use the session cwd without --celesto", async () => {
       );
     }
 
+    const promptHandler = handlers.get("before_agent_start")?.[0];
+    assert(promptHandler);
+    assert.equal(await promptHandler({ systemPrompt: "Local session prompt" }, context), undefined);
     assert(flags.has("celesto"));
     assert(flags.has("celesto-computer"));
     assert(commands.has("celesto"));

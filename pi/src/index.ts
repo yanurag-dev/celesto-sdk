@@ -547,9 +547,20 @@ export default function celestoPiExtension(pi: ExtensionAPI): void {
     if (!runtime) return undefined;
     const currentDirectory = `Current working directory: ${runtime.localRoot}`;
     const remoteDirectory = `Current working directory: ${runtime.remoteWorkspace} (${REMOTE_WORKSPACE_DISPLAY} on Celesto computer: ${runtime.computerName})`;
+    const localRoot = runtime.localRoot.replaceAll("\\", "/");
+    const remoteWorkspace = runtime.remoteWorkspace;
+    const cwdSection = new RegExp(
+      `<cwd>\\s*${localRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*</cwd>`,
+      "g",
+    );
+    const systemPrompt = event.systemPrompt.replace(
+      cwdSection,
+      () => `<cwd>${remoteWorkspace}</cwd>`,
+    );
+    if (systemPrompt !== event.systemPrompt) return { systemPrompt };
     return {
       systemPrompt: event.systemPrompt.includes(currentDirectory)
-        ? event.systemPrompt.replace(currentDirectory, remoteDirectory)
+        ? event.systemPrompt.replace(currentDirectory, () => remoteDirectory)
         : `${event.systemPrompt}\n\n${remoteDirectory}`,
     };
   });
